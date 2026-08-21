@@ -221,16 +221,26 @@ function buildQuestionGrid(n){$('questionGrid').innerHTML=Array.from({length:n},
 async function hydrateAnswered(){const {data}=await sb.from('answers').select('question_number,answer').eq('lobby_id',state.lobby.id).eq('user_id',state.me.id);(data||[]).forEach(a=>document.querySelector(`.q-btn[data-q="${a.question_number}"]`)?.classList.add('answered'));const saved=Number(localStorage.getItem('dueltest:q:'+state.lobby.id));state.currentQ=(saved>=1&&saved<=state.test.question_count)?saved:1;await selectQuestion(state.currentQ)}
 function parseTypes(n,ranges){const types={};const tokens=(ranges||'').split(',').map(x=>x.trim()).filter(Boolean);for(const token of tokens){let [range]=token.split('=');if(range.includes('-')){let [a,b]=range.split('-').map(Number);if(!Number.isFinite(a)||!Number.isFinite(b))continue;a=Math.max(1,Math.min(n,a));b=Math.max(a,Math.min(n,b));for(let i=a;i<=b;i++)types[i]='INTEGER'}else{const q=Number(range);if(q>=1&&q<=n)types[q]='INTEGER'}}return types}
 function typeFor(q){return (state.test.question_types||{})[String(q)]||'MCQ'}
+function canonicalMultiAnswer(value){
+  const chars=String(value||'').toUpperCase().replace(/\s+/g,'').split(',').filter(Boolean);
+  return [...new Set(chars)].filter(x=>/^[A-D]$/.test(x)).sort().join(',');
+}
 async function selectQuestion(q){
-  if(!state.test)return;q=Math.max(1,Math.min(state.test.question_count,q));state.currentQ=q;localStorage.setItem('dueltest:q:'+state.lobby.id,q);$('currentQuestion').textContent=q;$('battleProgress').textContent=`Question ${q} of ${state.test.question_count}`;const type=typeFor(q);$('currentTypeBadge').textContent=type;$('mcqOptions').classList.toggle('hidden',type!=='MCQ');$('submitMcq').classList.toggle('hidden',type!=='MCQ');$('integerInputWrap').classList.toggle('hidden',type!=='INTEGER');document.querySelectorAll('.q-btn').forEach(b=>b.classList.toggle('active',+b.dataset.q===q));
-  const {data:a}=await sb.from('answers').select('answer').eq('lobby_id',state.lobby.id).eq('user_id',state.me.id).eq('question_number',q).maybeSingle();state.selected=a?.answer||null;$('selectedAnswer').textContent=a?`Recorded: ${a.answer}`:'No answer recorded';$('integerInput').value=type==='INTEGER'?(a?.answer||''):'';document.querySelectorAll('.mcq-options button').forEach(b=>b.classList.toggle('selected',b.dataset.answer===a?.answer));
+  if(!state.test)return;q=Math.max(1,Math.min(state.test.question_count,q));state.currentQ=q;localStorage.setItem('dueltest:q:'+state.lobby.id,q);$('currentQuestion').textContent=q;$('battleProgress').textContent=`Question ${q} of ${state.test.question_count}`;
+  const type=typeFor(q);$('currentTypeBadge').textContent=type==='MULTI_CORRECT'?'MULTI-CORRECT':type;$('mcqOptions').classList.toggle('hidden',type!=='MCQ'&&type!=='MULTI_CORRECT');$('submitMcq').classList.toggle('hidden',type!=='MCQ'&&type!=='MULTI_CORRECT');$('integerInputWrap').classList.toggle('hidden',type!=='INTEGER');$('submitMcq').textContent=type==='MULTI_CORRECT'?'Submit selected options':'Submit answer';
+  document.querySelectorAll('.q-btn').forEach(b=>b.classList.toggle('active',+b.dataset.q===q));
+  const {data:a}=await sb.from('answers').select('answer').eq('lobby_id',state.lobby.id).eq('user_id',state.me.id).eq('question_number',q).maybeSingle();state.selected=a?.answer||null;$('selectedAnswer').textContent=a?`Recorded: ${a.answer}`:'No answer recorded';$('integerInput').value=type==='INTEGER'?(a?.answer||''):'';
+  const selected=type==='MULTI_CORRECT'?canonicalMultiAnswer(a?.answer):a?.answer;document.querySelectorAll('.mcq-options button').forEach(b=>b.classList.toggle('selected',type==='MULTI_CORRECT'?canonicalMultiAnswer(selected).split(',').includes(b.dataset.answer):b.dataset.answer===a?.answer));
   const pageHint=(state.test.page_map||{})[String(q)];if(pageHint)gotoGlobalPage(pageHint);
 }
-document.querySelectorAll('.mcq-options button').forEach(b=>b.onclick=()=>{state.selected=b.dataset.answer;document.querySelectorAll('.mcq-options button').forEach(x=>x.classList.toggle('selected',x===b))});
+document.querySelectorAll('.mcq-options button').forEach(b=>b.onclick=()=>{const type=typeFor(state.currentQ);if(type==='MULTI_CORRECT'){let vals=canonicalMultiAnswer(state.selected).split(',').filter(Boolean);vals=vals.includes(b.dataset.answer)?vals.filter(x=>x!==b.dataset.answer):[...vals,b.dataset.answer];state.selected=vals.sort().join(',');document.querySelectorAll('.mcq-options button').forEach(x=>x.classList.toggle('selected',vals.includes(x.dataset.answer)));}else{state.selected=b.dataset.answer;document.querySelectorAll('.mcq-options button').forEach(x=>x.classList.toggle('selected',x===b));}});
 $('submitMcq').onclick=()=>recordAnswer(state.selected);$('submitInteger').onclick=()=>recordAnswer($('integerInput').value.trim());
 async function recordAnswer(ans){
   if(!state.mine||state.mine.finished)return;if(!ans)return;
-  ans=String(ans).trim().toUpperCase();if(typeFor(state.currentQ)==='MCQ'&&!['A','B','C','D'].includes(ans))return modal('Invalid answer','MCQ answers must be A, B, C or D.');if(typeFor(state.currentQ)==='INTEGER'&&!/^-?\d+$/.test(ans))return modal('Invalid integer','Enter a whole integer, including a leading minus sign if needed.');
+  const type=typeFor(state.currentQ);ans=String(ans).trim().toUpperCase();
+  if(type==='MCQ'&&!['A','B','C','D'].includes(ans))return modal('Invalid answer','MCQ answers must be A, B, C or D.');
+  if(type==='MULTI_CORRECT'){ans=canonicalMultiAnswer(ans);if(!ans)return modal('Select an answer','Select at least one option for this multi-correct question.');}
+  if(type==='INTEGER'&&!/^-?\d+$/.test(ans))return modal('Invalid integer','Enter a whole integer, including a leading minus sign if needed.');
   const {error}=await sb.from('answers').upsert({lobby_id:state.lobby.id,user_id:state.me.id,question_number:state.currentQ,answer:ans},{onConflict:'lobby_id,user_id,question_number'});if(error)return modal('Could not save answer',esc(error.message));
   const {count}=await sb.from('answers').select('*',{count:'exact',head:true}).eq('lobby_id',state.lobby.id).eq('user_id',state.me.id);await sb.from('lobby_players').update({current_question:state.currentQ,answered_count:count||0}).eq('lobby_id',state.lobby.id).eq('user_id',state.me.id);
   $('selectedAnswer').textContent=`Recorded: ${ans}`;document.querySelector(`.q-btn[data-q="${state.currentQ}"]`)?.classList.add('answered');
@@ -238,7 +248,7 @@ async function recordAnswer(ans){
 
 function parseList(s){const out=[];(s||'').split(',').map(x=>x.trim()).filter(Boolean).forEach(x=>{if(x.includes('-')){let[a,b]=x.split('-').map(Number);if(Number.isFinite(a)&&Number.isFinite(b)){a=Math.min(a,b);b=Math.max(a,b);for(let i=a;i<=b;i++)out.push(i)}}else{const n=Number(x);if(Number.isFinite(n))out.push(n)}});return [...new Set(out)].sort((a,b)=>a-b)}
 function parsePartial(s){const out={};(s||'').split(',').map(x=>x.trim()).filter(Boolean).forEach(x=>{const [range,val]=x.split('=').map(y=>y.trim());const pct=Math.max(5,Math.min(95,Number(val)));if(!Number.isFinite(pct))return;if(range.includes('-')){let[a,b]=range.split('-').map(Number);a=Math.min(a,b);b=Math.max(a,b);for(let i=a;i<=b;i++)out[i]=pct/100}else{const n=Number(range);if(Number.isFinite(n))out[n]=pct/100}});return out}
-function parseIntegerRanges(s,n){return parseList(s).filter(q=>q>=1&&q<=n).reduce((o,q)=>(o[q]='INTEGER',o),{})}
+function parseTypeRanges(s,n,type){return parseList(s).filter(q=>q>=1&&q<=n).reduce((o,q)=>(o[q]=type,o),{})}
 
 async function loadPdfManifest(t){
   state.pdfDocs=[];state.pages=[];state.visiblePages=[];let global=0;
@@ -300,7 +310,7 @@ async function transitionToKeyIfReady(){
 async function refreshLobbyData(){const {data:l}=await sb.from('lobbies').select('*,tests(name,question_count,duration_minutes,question_types,page_rules,locked_pages,pdf_files)').eq('id',state.lobby.id).single();if(l)state.lobby=l}
 function showAnswerKey(){
   if(state.lobby.created_by!==state.me.id){state.keyShown=false;showWaitingFinish(false);return}
-  show('keyView');const types=state.test.question_types||{};$('answerKeyGrid').innerHTML=Array.from({length:state.test.question_count},(_,i)=>{const q=i+1,type=types[String(q)]||'MCQ';return `<div class="key-item"><label>Q${q} · ${type}</label><input data-key="${q}" maxlength="12" placeholder="${type==='MCQ'?'A / B / C / D':'Integer'}"></div>`}).join('')
+  show('keyView');const types=state.test.question_types||{};$('answerKeyGrid').innerHTML=Array.from({length:state.test.question_count},(_,i)=>{const q=i+1,type=types[String(q)]||'MCQ';const placeholder=type==='MCQ'?'A / B / C / D':type==='INTEGER'?'Integer':'A,C / A,C,D';return `<div class="key-item"><label>Q${q} · ${type==='MULTI_CORRECT'?'MULTI-CORRECT':type}</label><input data-key="${q}" maxlength="12" placeholder="${placeholder}"></div>`}).join('')
 }
 $('submitKeyBtn').onclick=submitAnswerKey;
 async function submitAnswerKey(){
@@ -309,9 +319,10 @@ async function submitAnswerKey(){
   document.querySelectorAll('[data-key]').forEach(i=>{let v=i.value.trim();if(v)v=v.toUpperCase();key[i.dataset.key]=v});
   if(Object.values(key).some(v=>!v))return modal('Answer key incomplete','Every question needs an official answer.');
   for(let q=1;q<=state.test.question_count;q++){
-    const v=key[String(q)];
-    if(typeFor(q)==='MCQ'&&!['A','B','C','D'].includes(v))return modal('Invalid key',`Q${q} is MCQ; enter A, B, C or D.`);
-    if(typeFor(q)==='INTEGER'&&!/^-?\d+$/.test(v))return modal('Invalid key',`Q${q} is INTEGER; enter a whole integer.`);
+    let v=key[String(q)];const type=typeFor(q);
+    if(type==='MCQ'&&!['A','B','C','D'].includes(v))return modal('Invalid key',`Q${q} is MCQ; enter A, B, C or D.`);
+    if(type==='INTEGER'&&!/^-?\d+$/.test(v))return modal('Invalid key',`Q${q} is INTEGER; enter a whole integer.`);
+    if(type==='MULTI_CORRECT'){v=canonicalMultiAnswer(v);if(!v)return modal('Invalid key',`Q${q} is MULTI-CORRECT; enter one or more of A, B, C, D, separated by commas.`);key[String(q)]=v;}
   }
   $('submitKeyBtn').disabled=true;
   const {data:attempt,error}=await sb.rpc('finalize_battle',{p_lobby_id:state.lobby.id,p_answer_key:key});
@@ -327,11 +338,11 @@ async function loadFinishedAttempt(){
 function renderResults(results,key){
   state.resultsShown=true;clearInterval(state.timer);show('resultsView');const rows=Array.isArray(results)?results:[];const sorted=[...rows].sort((a,b)=>b.correct-a.correct||b.answered-a.answered);const myResult=rows.find(r=>r.user_id===state.me.id);const top=sorted[0]?.correct??0;const winners=rows.filter(r=>r.correct===top);$('resultHeadline').textContent=myResult&&myResult.correct===top?(winners.length===1?'You win!':'You are tied for first.'):'Battle complete.';
   $('scoreGrid').innerHTML=rows.map(r=>`<div class="score-card ${r.user_id===state.me.id&&r.correct===sorted[0]?.correct?'winner':''}"><span>${esc(r.name)}${r.user_id===state.me.id?' (you)':''}</span><strong>${r.correct}</strong><small>${r.correct} / ${state.test.question_count} correct · ${r.answered} answered</small></div>`).join('');
-  const answersByQ={};rows.forEach(r=>Object.entries(r.answers||{}).forEach(([q,a])=>(answersByQ[q]??=[]).push({name:r.name,answer:a,uid:r.user_id})));$('comparisonRows').innerHTML=Array.from({length:state.test.question_count},(_,i)=>{const q=i+1,keyV=key[String(q)],vals=rows.map(r=>{const a=r.answers?.[q]??'—';return `<span class="${String(a).toUpperCase()===String(keyV).toUpperCase()?'correct':'wrong'}">${esc(r.name)}: ${esc(a)}</span>`}).join(' ');return `<div class="comparison-row"><b>Q${q}</b><div class="answer-chip">${vals}</div><span class="muted">${esc(keyV)}</span></div>`}).join('');
+  const answersByQ={};rows.forEach(r=>Object.entries(r.answers||{}).forEach(([q,a])=>(answersByQ[q]??=[]).push({name:r.name,answer:a,uid:r.user_id})));$('comparisonRows').innerHTML=Array.from({length:state.test.question_count},(_,i)=>{const q=i+1,keyV=key[String(q)],type=typeFor(q),vals=rows.map(r=>{const a=r.answers?.[q]??'—';const same=type==='MULTI_CORRECT'?canonicalMultiAnswer(a)===canonicalMultiAnswer(keyV):String(a).toUpperCase()===String(keyV).toUpperCase();return `<span class="${same?'correct':'wrong'}">${esc(r.name)}: ${esc(a)}</span>`}).join(' ');return `<div class="comparison-row"><b>Q${q}</b><div class="answer-chip">${vals}</div><span class="muted">${esc(keyV)}</span></div>`}).join('');
 }
 
 // ---------- Test Manager ----------
-function resetEditor(){state.editorId=null;state.editorExistingFiles=[];state.editorPdfDocs=[];state.editorPdfPages=[];state.editorPageIndex=0;state.partialRules={};$('editorTitle').textContent='Create a test';$('saveTestBtn').textContent='Create test';$('testNameInput').value='';$('durationInput').value=180;$('questionCountInput').value=90;$('pdfInput').value='';$('fileList').innerHTML='';$('existingFiles').innerHTML='';$('lockedPagesInput').value='';$('partialPagesInput').value='';$('integerRangesInput').value='';$('partialRangeInput').value='';renderPartialRules();renderEditorPreview();setMessage('')}
+function resetEditor(){state.editorId=null;state.editorExistingFiles=[];state.editorPdfDocs=[];state.editorPdfPages=[];state.editorPageIndex=0;state.partialRules={};$('editorTitle').textContent='Create a test';$('saveTestBtn').textContent='Create test';$('testNameInput').value='';$('durationInput').value=180;$('questionCountInput').value=90;$('pdfInput').value='';$('fileList').innerHTML='';$('existingFiles').innerHTML='';$('lockedPagesInput').value='';$('partialPagesInput').value='';$('integerRangesInput').value='';$('multiCorrectRangesInput').value='';$('partialRangeInput').value='';renderPartialRules();renderEditorPreview();setMessage('')}
 $('pdfInput').onchange=async()=>{$('fileList').innerHTML=[...$('pdfInput').files].map((f,i)=>`<span class="file-chip">${i+1}. ${esc(f.name)}</span>`).join('');await loadEditorPdfsFromFiles([...$('pdfInput').files]);};
 // ---------- Visual PDF cutoff editor ----------
 function rulesToPartialString(){return Object.entries(state.partialRules).filter(([,v])=>Number(v)<100).sort((a,b)=>+a[0]-+b[0]).map(([p,v])=>`${p}=${v}`).join(',')}
@@ -364,7 +375,11 @@ async function saveTest(){
     const n=Number(pct);
     if(Number.isFinite(n)&&n<100)pageRules[String(p)]={ratio:n/100};
   });
-  const questionTypes=parseIntegerRanges($('integerRangesInput').value,questionCount);
+  const integerTypes=parseTypeRanges($('integerRangesInput').value,questionCount,'INTEGER');
+  const multiTypes=parseTypeRanges($('multiCorrectRangesInput').value,questionCount,'MULTI_CORRECT');
+  const overlap=Object.keys(integerTypes).filter(q=>multiTypes[q]);
+  if(overlap.length)return setMessage(`Questions cannot be both INTEGER and MULTI-CORRECT: ${overlap.join(', ')}`);
+  const questionTypes={...integerTypes,...multiTypes};
 
   if(!name)return setMessage('Test name is required.');
   if(!Number.isInteger(duration)||duration<1||duration>1440)return setMessage('Duration must be between 1 and 1440 minutes.');
@@ -435,8 +450,8 @@ $('saveTestBtn').onclick=saveTest;
 
 async function loadTests(){if(!sb||!state.me)return;const {data,error}=await sb.from('tests').select('id,owner_id,name,question_count,duration_minutes,updated_at,pdf_files').eq('archived',false).order('updated_at',{ascending:false});if(error){if($('testsList'))$('testsList').innerHTML=`<div class="empty">${esc(error.message)}</div>`;return}$('testsList').innerHTML=(data||[]).map(t=>`<div class="test-list-item"><div class="item-main"><b>${esc(t.name)}</b><small>${t.question_count} questions · ${t.duration_minutes} min · updated ${new Date(t.updated_at).toLocaleString()}</small></div><div class="item-actions">${state.role==='superuser'?`<button class="small-btn" data-edit="${t.id}">Edit</button><button class="small-btn danger-btn" data-delete="${t.id}">Archive</button>`:''}</div></div>`).join('')||'<div class="empty">No tests yet.</div>';document.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>editTest(b.dataset.edit));document.querySelectorAll('[data-delete]').forEach(b=>b.onclick=()=>deleteTest(b.dataset.delete));}
 async function claimTest(id){const {error}=await sb.from('tests').update({owner_id:state.me.id}).eq('id',id).is('owner_id',null);if(error)return modal('Could not claim test',esc(error.message));loadTests()}
-async function editTest(id){const {data:t,error}=await sb.from('tests').select('*').eq('id',id).single();if(error)return modal('Could not load test',esc(error.message));if(state.role!=='superuser')return modal('Superuser only','Only Carneceria can edit tests.');state.editorId=id;state.editorExistingFiles=t.pdf_files||[];state.editorPdfDocs=[];state.editorPdfPages=[];state.editorPageIndex=0;state.partialRules={};Object.entries(t.page_rules||{}).forEach(([p,r])=>state.partialRules[+p]=Math.round((r.ratio||1)*100));$('editorTitle').textContent='Edit test';$('saveTestBtn').textContent='Save changes';$('testNameInput').value=t.name;$('durationInput').value=t.duration_minutes;$('questionCountInput').value=t.question_count;$('pdfInput').value='';$('fileList').innerHTML='';$('existingFiles').innerHTML=state.editorExistingFiles.map((f,i)=>`<span class="file-chip">${i+1}. ${esc(f.name)}</span>`).join('');$('lockedPagesInput').value=(t.locked_pages||[]).join(',');$('partialPagesInput').value=Object.entries(t.page_rules||{}).map(([p,r])=>`${p}=${Math.round((r.ratio||1)*100)}`).join(',');$('integerRangesInput').value=typesToRanges(t.question_types||{});renderPartialRules();await loadEditorPdfsFromStorage(state.editorExistingFiles);window.scrollTo({top:0,behavior:'smooth'})}
-function typesToRanges(types){const nums=Object.entries(types).filter(([,v])=>v==='INTEGER').map(([q])=>+q).sort((a,b)=>a-b);const out=[];for(let i=0;i<nums.length;i++){let a=nums[i],b=a;while(nums[i+1]===b+1){b=nums[++i]}out.push(a===b?String(a):`${a}-${b}`)}return out.join(',')}
+async function editTest(id){const {data:t,error}=await sb.from('tests').select('*').eq('id',id).single();if(error)return modal('Could not load test',esc(error.message));if(state.role!=='superuser')return modal('Superuser only','Only Carneceria can edit tests.');state.editorId=id;state.editorExistingFiles=t.pdf_files||[];state.editorPdfDocs=[];state.editorPdfPages=[];state.editorPageIndex=0;state.partialRules={};Object.entries(t.page_rules||{}).forEach(([p,r])=>state.partialRules[+p]=Math.round((r.ratio||1)*100));$('editorTitle').textContent='Edit test';$('saveTestBtn').textContent='Save changes';$('testNameInput').value=t.name;$('durationInput').value=t.duration_minutes;$('questionCountInput').value=t.question_count;$('pdfInput').value='';$('fileList').innerHTML='';$('existingFiles').innerHTML=state.editorExistingFiles.map((f,i)=>`<span class="file-chip">${i+1}. ${esc(f.name)}</span>`).join('');$('lockedPagesInput').value=(t.locked_pages||[]).join(',');$('partialPagesInput').value=Object.entries(t.page_rules||{}).map(([p,r])=>`${p}=${Math.round((r.ratio||1)*100)}`).join(',');$('integerRangesInput').value=typesToRanges(t.question_types||{},'INTEGER');$('multiCorrectRangesInput').value=typesToRanges(t.question_types||{},'MULTI_CORRECT');renderPartialRules();await loadEditorPdfsFromStorage(state.editorExistingFiles);window.scrollTo({top:0,behavior:'smooth'})}
+function typesToRanges(types,wantedType='INTEGER'){const nums=Object.entries(types).filter(([,v])=>v===wantedType).map(([q])=>+q).sort((a,b)=>a-b);const out=[];for(let i=0;i<nums.length;i++){let a=nums[i],b=a;while(nums[i+1]===b+1){b=nums[++i]}out.push(a===b?String(a):`${a}-${b}`)}return out.join(',')}
 async function deleteTest(id){if(state.role!=='superuser')return;if(!confirm('Archive this test? Existing battle history will remain available.'))return;const {error}=await sb.from('tests').update({archived:true}).eq('id',id);if(error)return modal('Could not archive test',esc(error.message));loadTests()}
 async function getVersion(id){const {data}=await sb.from('tests').select('version').eq('id',id).single();return data?.version||1}
 
