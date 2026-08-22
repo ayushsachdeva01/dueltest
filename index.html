@@ -31,7 +31,15 @@
 <section id="historyView" class="view"><div class="narrow wide"><button class="back-link" data-back>← Home</button><div class="section-heading"><div><div class="eyebrow">BATTLES</div><h2>Battle history</h2></div></div><div class="section-heading compact"><div><div class="eyebrow">ACTIVE</div><h3>Resume a battle</h3></div></div><div id="historyActiveList" class="history-list"></div><div class="section-heading compact"><div><div class="eyebrow">COMPLETED</div><h3>Past battles</h3></div></div><div id="historyList" class="history-list"></div></div></section>
 </main>
 <div id="modal" class="modal hidden"><div class="modal-backdrop"></div><div class="modal-card"><button class="modal-close" id="modalClose">×</button><div id="modalContent"></div></div></div>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
-<script src="config.js"></script><script src="app.js"></script>
+<script src="config.js"></script>
+<script type="module">
+  // Current PDF.js renderer: fixes glyph/font mapping problems found in older 3.x builds.
+  import * as pdfjsLib from "https://unpkg.com/pdfjs-dist@6.2.108/build/pdf.min.mjs";
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://unpkg.com/pdfjs-dist@6.2.108/build/pdf.worker.min.mjs";
+  window.pdfjsLib = pdfjsLib;
+  const app = document.createElement("script");
+  app.src = "app.js";
+  document.body.appendChild(app);
+</script>
 </body></html>
