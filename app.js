@@ -11,7 +11,8 @@ const state = {
   lobbyChannel:null,battleChannel:null,timer:null,
   battleEntered:false,finishSubmitted:false,keyShown:false,resultsShown:false,
   pdfDocs:[],pages:[],visiblePages:[],pageIndex:0,zoom:1.12,currentQ:1,selected:null,answers:{},answerBusy:false,answerFeedbackTimer:null,
-  editorId:null,editorExistingFiles:[],editorPdfDocs:[],editorPdfPages:[],editorPageIndex:0,partialRules:{},partialDrag:false
+  editorId:null,editorExistingFiles:[],editorPdfDocs:[],editorPdfPages:[],editorPageIndex:0,partialRules:{},partialDrag:false,
+  currentAttemptId:null,currentAttemptLobbyId:null,analysisPdfDocs:[],analysisPdfPages:[],analysisPageIndex:0,analysisZoom:1.12
 };
 
 function show(id){document.querySelectorAll('.view').forEach(v=>v.classList.remove('active'));$(id).classList.add('active');window.scrollTo(0,0)}
@@ -115,8 +116,13 @@ $('createLobbyCard').onclick=()=>openLobbyModal('create');
 $('joinLobbyCard').onclick=()=>openLobbyModal('join');
 $('adminBtn').onclick=()=>{if(state.role!=='superuser')return modal('Superuser only','Only Carneceria can manage tests.');if(!requireConfig())return;show('adminView');resetEditor();loadTests()};
 $('historyBtn').onclick=()=>{if(!requireConfig())return;show('historyView');loadHistory();loadActiveBattles()};
-$('resultsHomeBtn').onclick=()=>{cleanupBattle();show('homeView');loadActiveBattles();loadHistory()};
+$('resultsHomeBtn').onclick=()=>{cleanupBattle();state.currentAttemptId=null;state.currentAttemptLobbyId=null;clearAnalysisPdf();show('homeView');loadActiveBattles();loadHistory()};
 $('leaveFinishedBtn').onclick=()=>{cleanupBattle();show('homeView');loadActiveBattles()};
+$('deleteResultBtn').onclick=deleteCompletedBattle;
+$('analysisPrevPage').onclick=()=>nextAnalysisPage(-1);
+$('analysisNextPage').onclick=()=>nextAnalysisPage(1);
+$('analysisZoomIn').onclick=()=>{state.analysisZoom=Math.min(2.4,state.analysisZoom+.12);renderAnalysisPdfPage()};
+$('analysisZoomOut').onclick=()=>{state.analysisZoom=Math.max(.65,state.analysisZoom-.12);renderAnalysisPdfPage()};
 $('resetBtn')?.addEventListener('click',()=>location.reload());
 document.querySelectorAll('[data-back]').forEach(b=>b.onclick=()=>{cleanupBattle();show('homeView')});
 $('cancelEditBtn').onclick=resetEditor;
@@ -537,10 +543,20 @@ async function loadFinishedAttempt(){
   if(state.resultsShown)return;const {data:a}=await sb.from('attempts').select('*').eq('lobby_id',state.lobby.id).maybeSingle();if(!a)return;state.resultsShown=true;state.keyShown=false;state.test=state.lobby.tests||state.test;renderResults(a.results,a.answer_key)
 }
 function renderResults(results,key){
-  state.resultsShown=true;clearInterval(state.timer);show('resultsView');const rows=Array.isArray(results)?results:[];const sorted=[...rows].sort((a,b)=>b.correct-a.correct||b.answered-a.answered);const myResult=rows.find(r=>r.user_id===state.me.id);const top=sorted[0]?.correct??0;const winners=rows.filter(r=>r.correct===top);$('resultHeadline').textContent=myResult&&myResult.correct===top?(winners.length===1?'You win!':'You are tied for first.'):'Battle complete.';
-  $('scoreGrid').innerHTML=rows.map(r=>`<div class="score-card ${r.user_id===state.me.id&&r.correct===sorted[0]?.correct?'winner':''}"><span>${esc(r.name)}${r.user_id===state.me.id?' (you)':''}</span><strong>${r.correct}</strong><small>${r.correct} / ${state.test.question_count} correct · ${r.answered} answered</small></div>`).join('');
-  const answersByQ={};rows.forEach(r=>Object.entries(r.answers||{}).forEach(([q,a])=>(answersByQ[q]??=[]).push({name:r.name,answer:a,uid:r.user_id})));$('comparisonRows').innerHTML=Array.from({length:state.test.question_count},(_,i)=>{const q=i+1,keyV=key[String(q)],type=typeFor(q),vals=rows.map(r=>{const a=r.answers?.[q]??'—';const same=type==='MULTI_CORRECT'?canonicalMultiAnswer(a)===canonicalMultiAnswer(keyV):String(a).toUpperCase()===String(keyV).toUpperCase();return `<span class="${same?'correct':'wrong'}">${esc(r.name)}: ${esc(a)}</span>`}).join(' ');return `<div class="comparison-row"><b>Q${q}</b><div class="answer-chip">${vals}</div><span class="muted">${esc(keyV)}</span></div>`}).join('');
+  state.resultsShown=true;clearInterval(state.timer);show('resultsView');
+  const rows=Array.isArray(results)?results:[];const total=state.test?.question_count||0;
+  const sorted=[...rows].sort((a,b)=>b.correct-a.correct||b.answered-a.answered);const myResult=rows.find(r=>r.user_id===state.me.id);const top=sorted[0]?.correct??0;const winners=rows.filter(r=>r.correct===top);
+  $('resultHeadline').textContent=myResult&&myResult.correct===top?(winners.length===1?'You win!':'You are tied for first.'):'Battle complete.';
+  $('scoreGrid').innerHTML=rows.map(r=>`<div class="score-card ${r.user_id===state.me.id&&r.correct===sorted[0]?.correct?'winner':''}"><span>${esc(r.name)}${r.user_id===state.me.id?' (you)':''}</span><strong>${r.correct}</strong><small>${r.correct} / ${total} correct · ${r.answered} answered</small></div>`).join('');
+  if(myResult){
+    const rank=sorted.findIndex(r=>r.user_id===myResult.user_id)+1;const wrong=Math.max(0,(myResult.answered||0)-(myResult.correct||0));const unanswered=Math.max(0,total-(myResult.answered||0));const accuracy=myResult.answered?Math.round((myResult.correct/myResult.answered)*100):0;
+    $('analysisSummary').innerHTML=`<div class="analysis-stat"><b>${myResult.correct}/${total}</b><span>Score</span></div><div class="analysis-stat"><b>${accuracy}%</b><span>Accuracy</span></div><div class="analysis-stat"><b>${myResult.answered}</b><span>Answered · ${wrong} wrong</span></div><div class="analysis-stat"><b>#${rank}</b><span>Rank · ${unanswered} unanswered</span></div>`;
+  }else $('analysisSummary').innerHTML='';
+  $('deleteResultBtn').classList.toggle('hidden',!(state.lobby?.created_by===state.me.id));
+  $('comparisonRows').innerHTML=Array.from({length:total},(_,i)=>{const q=i+1,keyV=key[String(q)]??'—',type=typeFor(q),vals=rows.map(r=>{const a=r.answers?.[q]??'—';const same=type==='MULTI_CORRECT'?canonicalMultiAnswer(a)===canonicalMultiAnswer(keyV):String(a).toUpperCase()===String(keyV).toUpperCase();return `<span class="${same?'correct':'wrong'}">${esc(r.name)}: ${esc(a)}</span>`}).join(' ');return `<div class="comparison-row"><b>Q${q}</b><div class="answer-chip">${vals}</div><span class="muted">${esc(keyV)}</span></div>`}).join('');
+  if(state.test?.pdf_files?.length)loadAnalysisPdf(state.test);else clearAnalysisPdf();
 }
+
 
 // ---------- Test Manager ----------
 function resetEditor(){state.editorId=null;state.editorExistingFiles=[];state.editorPdfDocs=[];state.editorPdfPages=[];state.editorPageIndex=0;state.partialRules={};$('editorTitle').textContent='Create a test';$('saveTestBtn').textContent='Create test';$('testNameInput').value='';$('durationInput').value=180;$('questionCountInput').value=90;$('pdfInput').value='';$('fileList').innerHTML='';$('existingFiles').innerHTML='';$('lockedPagesInput').value='';$('partialPagesInput').value='';$('integerRangesInput').value='';$('multiCorrectRangesInput').value='';$('partialRangeInput').value='';renderPartialRules();renderEditorPreview();setMessage('')}
@@ -656,14 +672,74 @@ function typesToRanges(types,wantedType='INTEGER'){const nums=Object.entries(typ
 async function deleteTest(id){if(state.role!=='superuser')return;if(!confirm('Archive this test? Existing battle history will remain available.'))return;const {error}=await sb.from('tests').update({archived:true}).eq('id',id);if(error)return modal('Could not archive test',esc(error.message));loadTests()}
 async function getVersion(id){const {data}=await sb.from('tests').select('version').eq('id',id).single();return data?.version||1}
 
-async function viewHistory(id){const {data:a,error}=await sb.from('attempts').select('*').eq('id',id).single();if(error)return modal('Could not load battle',esc(error.message));const {data:t}=await sb.from('tests').select('question_count,question_types,name').eq('id',a.test_id).maybeSingle();state.test=t||{question_count:Math.max(...(a.results||[]).flatMap(r=>Object.keys(r.answers||{}).map(Number)),0),question_types:{},name:a.test_name};show('resultsView');renderResults(a.results,a.answer_key)}
+async function viewHistory(id){
+  const {data:a,error}=await sb.from('attempts').select('*').eq('id',id).single();
+  if(error)return modal('Could not load battle',esc(error.message));
+  const {data:t}=await sb.from('tests').select('question_count,question_types,name,pdf_files,page_rules,locked_pages').eq('id',a.test_id).maybeSingle();
+  state.currentAttemptId=a.id;state.currentAttemptLobbyId=a.lobby_id;
+  state.test=t||{question_count:Math.max(...(a.results||[]).flatMap(r=>Object.keys(r.answers||{}).map(Number)),0),question_types:{},name:a.test_name,pdf_files:[]};
+  state.lobby={id:a.lobby_id,created_by:null,status:'finished'};
+  const {data:lobby}=await sb.from('lobbies').select('id,created_by,status').eq('id',a.lobby_id).maybeSingle();
+  if(lobby)state.lobby={...state.lobby,...lobby};
+  show('resultsView');
+  renderResults(a.results,a.answer_key);
+}
+
+async function deleteCompletedBattle(){
+  const lobbyId=state.currentAttemptLobbyId||state.lobby?.id;
+  if(!lobbyId)return modal('Could not delete battle','This history entry is missing its lobby reference.');
+  const {data:lobby,error:loadError}=await sb.from('lobbies').select('id,created_by,status').eq('id',lobbyId).maybeSingle();
+  if(loadError)return modal('Could not delete battle',esc(loadError.message));
+  if(!lobby)return modal('Battle already deleted','This completed battle no longer exists. Refreshing history.');
+  if(lobby.created_by!==state.me.id)return modal('Host only','Only the host can permanently delete a completed battle.');
+  if(lobby.status!=='finished')return modal('Cannot delete battle','Only completed battles can be deleted.');
+  if(!confirm('Delete this completed battle permanently? Its answers, results, and battle history will be removed.'))return;
+  const {error}=await sb.from('lobbies').delete().eq('id',lobbyId).eq('created_by',state.me.id);
+  if(error)return modal('Could not delete battle',esc(error.message));
+  state.currentAttemptId=null;state.currentAttemptLobbyId=null;state.lobby=null;clearAnalysisPdf();
+  show('historyView');await loadHistory();await loadActiveBattles();
+}
 
 async function loadHistory(){
-  const {data,error}=await sb.from('attempts').select('id,test_id,test_name,completed_at,results').order('completed_at',{ascending:false});
+  const {data,error}=await sb.from('attempts').select('id,lobby_id,test_id,test_name,completed_at,results').order('completed_at',{ascending:false});
   if(error){$('historyList').innerHTML=`<div class="empty">${esc(error.message)}</div>`;return}
-  $('historyList').innerHTML=(data||[]).map(a=>{const me=a.results?.find(r=>r.user_id===state.me.id);return `<div class="history-item"><div class="item-main"><b>${esc(a.test_name)}</b><small>${new Date(a.completed_at).toLocaleString()} · ${(a.results||[]).length} players</small></div><div class="history-score">${me?.correct??0} correct</div><div class="item-actions"><button class="small-btn" data-history="${a.id}">View</button></div></div>`}).join('')||'<div class="empty">No completed battles yet.</div>';
+  const rows=data||[];
+  const lobbyIds=rows.map(a=>a.lobby_id).filter(Boolean);
+  let lobbyMap={};
+  if(lobbyIds.length){const {data:lobbies}=await sb.from('lobbies').select('id,created_by,status').in('id',lobbyIds);(lobbies||[]).forEach(l=>lobbyMap[l.id]=l)}
+  $('historyList').innerHTML=rows.map(a=>{const me=a.results?.find(r=>r.user_id===state.me.id);const lobby=lobbyMap[a.lobby_id];const canDelete=lobby?.created_by===state.me.id&&lobby?.status==='finished';return `<div class="history-item"><div class="item-main"><b>${esc(a.test_name)}</b><small>${new Date(a.completed_at).toLocaleString()} · ${(a.results||[]).length} players</small></div><div class="history-score">${me?.correct??0} correct</div><div class="item-actions"><button class="small-btn" data-history="${a.id}">View</button>${canDelete?`<button class="small-btn danger-btn" data-delete-history="${a.id}" data-delete-lobby="${a.lobby_id}">Delete</button>`:''}</div></div>`}).join('')||'<div class="empty">No completed battles yet.</div>';
   document.querySelectorAll('[data-history]').forEach(b=>b.onclick=()=>viewHistory(b.dataset.history));
+  document.querySelectorAll('[data-delete-history]').forEach(b=>b.onclick=async()=>{const id=b.dataset.deleteHistory,lobbyId=b.dataset.deleteLobby;if(!confirm('Delete this completed battle permanently? Its answers, results, and battle history will be removed.'))return;b.disabled=true;const {error:e}=await sb.from('lobbies').delete().eq('id',lobbyId).eq('created_by',state.me.id);if(e){b.disabled=false;return modal('Could not delete battle',esc(e.message))}if(state.currentAttemptId===id){state.currentAttemptId=null;state.currentAttemptLobbyId=null;clearAnalysisPdf()}await loadHistory();await loadActiveBattles()});
 }
+
+function clearAnalysisPdf(){state.analysisPdfDocs=[];state.analysisPdfPages=[];state.analysisPageIndex=0;$('analysisPageNumber').textContent='1';$('analysisPageTotal').textContent='0';$('analysisPdfMessage').textContent='No test PDF loaded.';$('analysisPdfCanvas').width=0;$('analysisPdfCanvas').height=0}
+async function loadAnalysisPdf(t){
+  clearAnalysisPdf();
+  const files=t?.pdf_files||[];
+  if(!files.length){$('analysisPdfMessage').textContent='This test has no PDF attached.';return}
+  $('analysisPdfMessage').textContent='Loading test PDF…';let global=0;
+  for(const f of files){
+    try{
+      const {data:signed,error}=await sb.storage.from('test-pdfs').createSignedUrl(f.path,3600);
+      if(error||!signed?.signedUrl)throw error||new Error('Could not authorize PDF access.');
+      const pdf=await window.pdfjsLib.getDocument({url:signed.signedUrl,disableAutoFetch:false}).promise;
+      state.analysisPdfDocs.push({pdf,name:f.name});
+      for(let page=1;page<=pdf.numPages;page++)state.analysisPdfPages.push({global:++global,doc:pdf,page});
+    }catch(e){console.error('analysis PDF load failed',e);modal('Test PDF could not load',`<p>${esc(f.name)}</p><p class="hint">${esc(e.message||e)}</p>`)}
+  }
+  $('analysisPageTotal').textContent=state.analysisPdfPages.length||0;
+  if(state.analysisPdfPages.length)await renderAnalysisPdfPage();else $('analysisPdfMessage').textContent='No PDF pages could be loaded.';
+}
+async function renderAnalysisPdfPage(){
+  const p=state.analysisPdfPages[state.analysisPageIndex];if(!p)return;
+  $('analysisPageNumber').textContent=state.analysisPageIndex+1;$('analysisPdfMessage').textContent='';
+  const pg=await p.doc.getPage(p.page);const viewport=pg.getViewport({scale:state.analysisZoom});
+  const canvas=$('analysisPdfCanvas'),wrap=$('analysisPdfWrap');const outputScale=Math.min(Math.max(window.devicePixelRatio||1,1),3);
+  canvas.width=Math.ceil(viewport.width*outputScale);canvas.height=Math.ceil(viewport.height*outputScale);canvas.style.width=Math.ceil(viewport.width)+'px';canvas.style.height=Math.ceil(viewport.height)+'px';wrap.style.width=Math.ceil(viewport.width)+'px';wrap.style.height=Math.ceil(viewport.height)+'px';
+  const ctx=canvas.getContext('2d',{alpha:false,desynchronized:true});ctx.setTransform(outputScale,0,0,outputScale,0,0);await pg.render({canvasContext:ctx,viewport}).promise;
+}
+function nextAnalysisPage(delta){const next=state.analysisPageIndex+delta;if(next<0||next>=state.analysisPdfPages.length)return;state.analysisPageIndex=next;renderAnalysisPdfPage()}
+
 
 // A small guard against stale tabs attempting to re-enter a finished battle.
 window.addEventListener('beforeunload',()=>{clearInterval(state.timer);if(state.lobbyChannel)sb?.removeChannel(state.lobbyChannel);if(state.battleChannel)sb?.removeChannel(state.battleChannel)});
