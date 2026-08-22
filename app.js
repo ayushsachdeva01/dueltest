@@ -10,7 +10,7 @@ const state = {
   me:null,lobby:null,test:null,mine:null,players:[],
   lobbyChannel:null,battleChannel:null,timer:null,
   battleEntered:false,finishSubmitted:false,keyShown:false,resultsShown:false,
-  pdfDocs:[],pages:[],visiblePages:[],pageIndex:0,zoom:1.12,currentQ:1,selected:null,
+  pdfDocs:[],pages:[],visiblePages:[],pageIndex:0,zoom:1.12,currentQ:1,selected:null,answers:{},answerBusy:false,answerFeedbackTimer:null,
   editorId:null,editorExistingFiles:[],editorPdfDocs:[],editorPdfPages:[],editorPageIndex:0,partialRules:{},partialDrag:false
 };
 
@@ -89,7 +89,7 @@ function enterApp(){
   show('homeView');
   $('headerUsername').textContent=state.profile.display_name||state.profile.username;$('headerAvatar').textContent=(state.profile.display_name||state.profile.username).slice(0,1).toUpperCase();
   document.querySelectorAll('.superuser-only').forEach(el=>el.classList.toggle('hidden',state.profile.role!=='superuser'));
-  setStatus('Signed in',true);loadTests();loadHistory();
+  setStatus('Signed in',true);loadTests();loadHistory();loadActiveBattles();
 }
 async function signIn(){
   const username=normalizeUsername($('loginUsername').value),password=$('loginPassword').value;
@@ -114,9 +114,9 @@ async function toggleUser(id){const {data,error}=await sb.from('profiles').selec
 $('createLobbyCard').onclick=()=>openLobbyModal('create');
 $('joinLobbyCard').onclick=()=>openLobbyModal('join');
 $('adminBtn').onclick=()=>{if(state.role!=='superuser')return modal('Superuser only','Only Carneceria can manage tests.');if(!requireConfig())return;show('adminView');resetEditor();loadTests()};
-$('historyBtn').onclick=()=>{if(!requireConfig())return;show('historyView');loadHistory()};
-$('resultsHomeBtn').onclick=()=>{cleanupBattle();show('homeView')};
-$('leaveFinishedBtn').onclick=()=>{cleanupBattle();show('homeView')};
+$('historyBtn').onclick=()=>{if(!requireConfig())return;show('historyView');loadHistory();loadActiveBattles()};
+$('resultsHomeBtn').onclick=()=>{cleanupBattle();show('homeView');loadActiveBattles();loadHistory()};
+$('leaveFinishedBtn').onclick=()=>{cleanupBattle();show('homeView');loadActiveBattles()};
 $('resetBtn')?.addEventListener('click',()=>location.reload());
 document.querySelectorAll('[data-back]').forEach(b=>b.onclick=()=>{cleanupBattle();show('homeView')});
 $('cancelEditBtn').onclick=resetEditor;
@@ -147,6 +147,60 @@ async function joinLobby(){
   if(error)return modal('Could not join',esc(error.message));
   const row=Array.isArray(data)?data[0]:data;if(!row?.lobby_id)return modal('Could not join','The server did not return a lobby.');
   const {data:l,error:le}=await sb.from('lobbies').select('*').eq('id',row.lobby_id).single();if(le)return modal('Could not load lobby',esc(le.message));closeModal();state.lobby=l;await openLobby(l.id)
+}
+
+async function loadActiveBattles(){
+  if(!sb||!state.me)return;
+  const box=$('activeBattlesList');
+  const historyActive=$('historyActiveList');
+  const targets=[box,historyActive].filter(Boolean);
+  if(!targets.length)return;
+  targets.forEach(el=>el.innerHTML='<div class="empty">Loading active battles…</div>');
+  const {data:members,error:memberError}=await sb.from('lobby_players')
+    .select('lobby_id,finished,finished_at,current_question,answered_count,slot,name')
+    .eq('user_id',state.me.id);
+  if(memberError){targets.forEach(el=>el.innerHTML=`<div class="empty">${esc(memberError.message)}</div>`);return}
+  const ids=[...new Set((members||[]).map(x=>x.lobby_id).filter(Boolean))];
+  if(!ids.length){targets.forEach(el=>el.innerHTML='<div class="empty">No active battles. Start a new duel or join one with a code.</div>');return}
+  const {data:lobbies,error:lobbyError}=await sb.from('lobbies')
+    .select('id,code,status,max_players,created_by,test_id,start_time,created_at,tests(name,question_count,duration_minutes)')
+    .in('id',ids)
+    .in('status',['waiting','running'])
+    .order('created_at',{ascending:false});
+  if(lobbyError){targets.forEach(el=>el.innerHTML=`<div class="empty">${esc(lobbyError.message)}</div>`);return}
+  const rows=(lobbies||[]).map(l=>({...l,mine:(members||[]).find(m=>m.lobby_id===l.id)}));
+  const html=rows.length?rows.map(l=>{
+    const host=l.created_by===state.me.id;
+    const status=l.status==='waiting'?'Waiting for players':'Battle in progress';
+    const progress=l.status==='running'&&l.mine?.finished?'You finished · waiting for the battle':'Resume where you left off';
+    return `<div class="history-item active-battle-item"><div class="item-main"><b>${esc(l.tests?.name||'Battle')}</b><small>${esc(status)} · ${l.tests?.question_count||'—'} questions · ${esc(progress)}</small></div><div class="item-actions"><button class="small-btn" data-resume-lobby="${l.id}">${l.status==='waiting'?'Open lobby':'Resume'}</button>${host?`<button class="small-btn danger-btn" data-cancel-lobby="${l.id}">Cancel</button>`:''}</div></div>`;
+  }).join(''):'<div class="empty">No active battles. Completed battles appear below.</div>';
+  targets.forEach(el=>el.innerHTML=html);
+  document.querySelectorAll('[data-resume-lobby]').forEach(b=>b.onclick=()=>resumeLobby(b.dataset.resumeLobby));
+  document.querySelectorAll('[data-cancel-lobby]').forEach(b=>b.onclick=()=>cancelLobby(b.dataset.cancelLobby));
+}
+async function resumeLobby(id){
+  const {data:l,error}=await sb.from('lobbies').select('*,tests(name,question_count,duration_minutes,question_types,page_rules,locked_pages,pdf_files)').eq('id',id).single();
+  if(error)return modal('Could not resume battle',esc(error.message));
+  state.lobby=l;closeModal();await openLobby(id);
+}
+async function cancelLobby(id){
+  const {data:l,error:loadError}=await sb.from('lobbies').select('id,created_by,status').eq('id',id).single();
+  if(loadError)return modal('Could not load battle',esc(loadError.message));
+  if(l.created_by!==state.me.id)return modal('Host only','Only the host can cancel this battle.');
+  if(!confirm('Cancel this battle? Players will no longer be able to resume it.'))return;
+  // The database intentionally allows only waiting/running/finished lobby statuses.
+  // A cancelled lobby is therefore removed instead of writing an invalid status.
+  // The lobby's child rows (players/answers/attempts) cascade-delete in Supabase.
+  const {error}=await sb.from('lobbies').delete().eq('id',id).eq('created_by',state.me.id).in('status',['waiting','running']);
+  if(error)return modal('Could not cancel battle',esc(error.message));
+  if(state.lobby?.id===id){
+    cleanupBattle();
+    state.lobby=null;state.players=[];state.mine=null;
+    show('homeView');
+  }
+  await loadActiveBattles();
+  await loadHistory();
 }
 
 async function openLobby(id){
@@ -187,7 +241,7 @@ async function enterBattle(){
   await loadPdfManifest(state.test);await hydrateAnswered();subscribeBattle();startTimer();updateLivePlayers();
 }
 function cleanupChannels(){if(state.lobbyChannel){sb?.removeChannel(state.lobbyChannel);state.lobbyChannel=null}if(state.battleChannel){sb?.removeChannel(state.battleChannel);state.battleChannel=null}}
-function cleanupBattle(){clearInterval(state.timer);cleanupChannels();state.battleEntered=false;state.finishSubmitted=false;state.keyShown=false;state.resultsShown=false;state.pdfDocs=[];state.pages=[];state.visiblePages=[]}
+function cleanupBattle(){clearInterval(state.timer);cleanupChannels();if(state.answerFeedbackTimer)clearTimeout(state.answerFeedbackTimer);state.battleEntered=false;state.finishSubmitted=false;state.keyShown=false;state.resultsShown=false;state.answerBusy=false;state.answers={};state.selected=null;state.pdfDocs=[];state.pages=[];state.visiblePages=[]}
 function subscribeBattle(){
   if(state.battleChannel)sb.removeChannel(state.battleChannel);
   state.battleChannel=sb.channel('battle-'+state.lobby.id)
@@ -209,6 +263,7 @@ async function refreshPlayersOnly(){
 function updateLivePlayers(){
   const others=state.players.filter(p=>p.user_id!==state.me.id);
   $('livePlayers').innerHTML=state.players.map(p=>`<div class="live-player"><span class="mini">${esc(p.name.slice(0,1).toUpperCase())}</span><div><b>${esc(p.name)}${p.user_id===state.me.id?' (you)':''}</b><small>${p.finished?'Finished':p.user_id===state.me.id?'You are solving':'Latest Q '+(p.current_question||'—')}</small></div><span class="live-count">${p.answered_count||0}</span></div>`).join('');
+  updateBattleNudge();
   const mine=state.mine;
   const allFinished=state.players.length>0&&state.players.every(p=>p.finished);
   if(mine&&mine.finished&&!state.keyShown&&state.lobby.status==='running'){
@@ -217,8 +272,33 @@ function updateLivePlayers(){
   }
   if(others.length===1){/* layout intentionally supports any 2/3 player lobby */}
 }
+function updateBattleNudge(){
+  const el=$('liveBattleNudge');if(!el)return;
+  const mine=state.mine?.answered_count||0;
+  const others=state.players.filter(p=>p.user_id!==state.me.id);
+  if(!others.length){el.textContent='You are setting the pace. Make it count.';return}
+  const counts=others.map(p=>p.answered_count||0);
+  const leader=Math.max(...counts,0);
+  const avg=counts.reduce((a,b)=>a+b,0)/counts.length;
+  if(mine>leader)el.textContent=['You are ahead. Keep the pressure on.','Nice lead — do not give them a comeback.','You are setting the pace. 🚀'][mine%3];
+  else if(mine===leader&&mine>0)el.textContent='Neck and neck. One clean answer can swing it.';
+  else if(mine>=avg)el.textContent='You are right in the mix. Keep moving.';
+  else if(mine+1>=leader)el.textContent='Closing the gap. Your next answer matters.';
+  else el.textContent='They have the pace right now. Time to chase.';
+}
 function buildQuestionGrid(n){$('questionGrid').innerHTML=Array.from({length:n},(_,i)=>`<button class="q-btn" data-q="${i+1}">${i+1}</button>`).join('');document.querySelectorAll('.q-btn').forEach(b=>b.onclick=()=>selectQuestion(+b.dataset.q))}
-async function hydrateAnswered(){const {data}=await sb.from('answers').select('question_number,answer').eq('lobby_id',state.lobby.id).eq('user_id',state.me.id);(data||[]).forEach(a=>document.querySelector(`.q-btn[data-q="${a.question_number}"]`)?.classList.add('answered'));const saved=Number(localStorage.getItem('dueltest:q:'+state.lobby.id));state.currentQ=(saved>=1&&saved<=state.test.question_count)?saved:1;await selectQuestion(state.currentQ)}
+async function hydrateAnswered(){
+  const cacheKey='dueltest:answers:'+state.lobby.id+':'+state.me.id;
+  let cached={};
+  try{cached=JSON.parse(localStorage.getItem(cacheKey)||'{}')||{}}catch{}
+  state.answers={...cached};
+  Object.keys(state.answers).forEach(q=>document.querySelector(`.q-btn[data-q="${q}"]`)?.classList.add('answered'));
+  const {data,error}=await sb.from('answers').select('question_number,answer').eq('lobby_id',state.lobby.id).eq('user_id',state.me.id);
+  if(!error){state.answers={};(data||[]).forEach(a=>{state.answers[String(a.question_number)]=a.answer;document.querySelector(`.q-btn[data-q="${a.question_number}"]`)?.classList.add('answered')});try{localStorage.setItem(cacheKey,JSON.stringify(state.answers))}catch{}}
+  const saved=Number(localStorage.getItem('dueltest:q:'+state.lobby.id));
+  state.currentQ=(saved>=1&&saved<=state.test.question_count)?saved:1;
+  await selectQuestion(state.currentQ);
+}
 function parseTypes(n,ranges){const types={};const tokens=(ranges||'').split(',').map(x=>x.trim()).filter(Boolean);for(const token of tokens){let [range]=token.split('=');if(range.includes('-')){let [a,b]=range.split('-').map(Number);if(!Number.isFinite(a)||!Number.isFinite(b))continue;a=Math.max(1,Math.min(n,a));b=Math.max(a,Math.min(n,b));for(let i=a;i<=b;i++)types[i]='INTEGER'}else{const q=Number(range);if(q>=1&&q<=n)types[q]='INTEGER'}}return types}
 function typeFor(q){return (state.test.question_types||{})[String(q)]||'MCQ'}
 function canonicalMultiAnswer(value){
@@ -226,25 +306,118 @@ function canonicalMultiAnswer(value){
   return [...new Set(chars)].filter(x=>/^[A-D]$/.test(x)).sort().join(',');
 }
 async function selectQuestion(q){
-  if(!state.test)return;q=Math.max(1,Math.min(state.test.question_count,q));state.currentQ=q;localStorage.setItem('dueltest:q:'+state.lobby.id,q);$('currentQuestion').textContent=q;$('battleProgress').textContent=`Question ${q} of ${state.test.question_count}`;
-  const type=typeFor(q);$('currentTypeBadge').textContent=type==='MULTI_CORRECT'?'MULTI-CORRECT':type;$('mcqOptions').classList.toggle('hidden',type!=='MCQ'&&type!=='MULTI_CORRECT');$('submitMcq').classList.toggle('hidden',type!=='MCQ'&&type!=='MULTI_CORRECT');$('integerInputWrap').classList.toggle('hidden',type!=='INTEGER');$('submitMcq').textContent=type==='MULTI_CORRECT'?'Submit selected options':'Submit answer';
+  if(!state.test)return;
+  q=Math.max(1,Math.min(state.test.question_count,q));
+  state.currentQ=q;
+  localStorage.setItem('dueltest:q:'+state.lobby.id,q);
+  $('currentQuestion').textContent=q;
+  $('battleProgress').textContent=`Question ${q} of ${state.test.question_count}`;
+  const type=typeFor(q);
+  $('currentTypeBadge').textContent=type==='MULTI_CORRECT'?'MULTI-CORRECT':type;
+  $('mcqOptions').classList.toggle('hidden',type!=='MCQ'&&type!=='MULTI_CORRECT');
+  $('submitMcq').classList.toggle('hidden',type!=='MCQ'&&type!=='MULTI_CORRECT');
+  $('integerInputWrap').classList.toggle('hidden',type!=='INTEGER');
+  $('submitMcq').textContent=type==='MULTI_CORRECT'?'Submit selected options':'Submit answer';
   document.querySelectorAll('.q-btn').forEach(b=>b.classList.toggle('active',+b.dataset.q===q));
-  const {data:a}=await sb.from('answers').select('answer').eq('lobby_id',state.lobby.id).eq('user_id',state.me.id).eq('question_number',q).maybeSingle();state.selected=a?.answer||null;$('selectedAnswer').textContent=a?`Recorded: ${a.answer}`:'No answer recorded';$('integerInput').value=type==='INTEGER'?(a?.answer||''):'';
-  const selected=type==='MULTI_CORRECT'?canonicalMultiAnswer(a?.answer):a?.answer;document.querySelectorAll('.mcq-options button').forEach(b=>b.classList.toggle('selected',type==='MULTI_CORRECT'?canonicalMultiAnswer(selected).split(',').includes(b.dataset.answer):b.dataset.answer===a?.answer));
+  const a=state.answers[String(q)];
+  state.selected=a||null;
+  $('selectedAnswer').textContent=a?`Recorded: ${a}`:'No answer recorded';
+  $('integerInput').value=type==='INTEGER'?(a||''):'';
+  const selected=type==='MULTI_CORRECT'?canonicalMultiAnswer(a):a;
+  document.querySelectorAll('.mcq-options button').forEach(b=>b.classList.toggle('selected',type==='MULTI_CORRECT'?canonicalMultiAnswer(selected).split(',').includes(b.dataset.answer):b.dataset.answer===a));
   const pageHint=(state.test.page_map||{})[String(q)];if(pageHint)gotoGlobalPage(pageHint);
 }
-document.querySelectorAll('.mcq-options button').forEach(b=>b.onclick=()=>{const type=typeFor(state.currentQ);if(type==='MULTI_CORRECT'){let vals=canonicalMultiAnswer(state.selected).split(',').filter(Boolean);vals=vals.includes(b.dataset.answer)?vals.filter(x=>x!==b.dataset.answer):[...vals,b.dataset.answer];state.selected=vals.sort().join(',');document.querySelectorAll('.mcq-options button').forEach(x=>x.classList.toggle('selected',vals.includes(x.dataset.answer)));}else{state.selected=b.dataset.answer;document.querySelectorAll('.mcq-options button').forEach(x=>x.classList.toggle('selected',x===b));}});
-$('submitMcq').onclick=()=>recordAnswer(state.selected);$('submitInteger').onclick=()=>recordAnswer($('integerInput').value.trim());
-async function recordAnswer(ans){
-  if(!state.mine||state.mine.finished)return;if(!ans)return;
-  const type=typeFor(state.currentQ);ans=String(ans).trim().toUpperCase();
-  if(type==='MCQ'&&!['A','B','C','D'].includes(ans))return modal('Invalid answer','MCQ answers must be A, B, C or D.');
-  if(type==='MULTI_CORRECT'){ans=canonicalMultiAnswer(ans);if(!ans)return modal('Select an answer','Select at least one option for this multi-correct question.');}
-  if(type==='INTEGER'&&!/^-?\d+$/.test(ans))return modal('Invalid integer','Enter a whole integer, including a leading minus sign if needed.');
-  const {error}=await sb.from('answers').upsert({lobby_id:state.lobby.id,user_id:state.me.id,question_number:state.currentQ,answer:ans},{onConflict:'lobby_id,user_id,question_number'});if(error)return modal('Could not save answer',esc(error.message));
-  const {count}=await sb.from('answers').select('*',{count:'exact',head:true}).eq('lobby_id',state.lobby.id).eq('user_id',state.me.id);await sb.from('lobby_players').update({current_question:state.currentQ,answered_count:count||0}).eq('lobby_id',state.lobby.id).eq('user_id',state.me.id);
-  $('selectedAnswer').textContent=`Recorded: ${ans}`;document.querySelector(`.q-btn[data-q="${state.currentQ}"]`)?.classList.add('answered');
+document.querySelectorAll('.mcq-options button').forEach(b=>b.onclick=()=>{
+  if(state.answerBusy)return;
+  const type=typeFor(state.currentQ);
+  if(type==='MULTI_CORRECT'){
+    let vals=canonicalMultiAnswer(state.selected).split(',').filter(Boolean);
+    vals=vals.includes(b.dataset.answer)?vals.filter(x=>x!==b.dataset.answer):[...vals,b.dataset.answer];
+    state.selected=vals.sort().join(',');
+    document.querySelectorAll('.mcq-options button').forEach(x=>x.classList.toggle('selected',vals.includes(x.dataset.answer)));
+  }else{
+    state.selected=b.dataset.answer;
+    document.querySelectorAll('.mcq-options button').forEach(x=>x.classList.toggle('selected',x===b));
+  }
+  $('selectedAnswer').textContent=state.selected?`Selected: ${state.selected} · Press Enter to submit`:'No answer selected';
+});
+$('submitMcq').onclick=()=>recordAnswer(state.selected,{advance:true});
+$('submitInteger').onclick=()=>recordAnswer($('integerInput').value.trim(),{advance:true});
+function setAnswerFeedback(text,good=true){
+  $('selectedAnswer').textContent=text;
+  $('selectedAnswer').classList.toggle('answer-success',good);
 }
+async function recordAnswer(ans,{advance=true}={}){
+  if(state.answerBusy||!state.mine||state.mine.finished)return false;
+  if(!ans)return false;
+  const q=state.currentQ;
+  const type=typeFor(q);
+  ans=String(ans).trim().toUpperCase();
+  if(type==='MCQ'&&!['A','B','C','D'].includes(ans)){modal('Invalid answer','MCQ answers must be A, B, C or D.');return false}
+  if(type==='MULTI_CORRECT'){ans=canonicalMultiAnswer(ans);if(!ans){modal('Select an answer','Select at least one option for this multi-correct question.');return false}}
+  if(type==='INTEGER'&&!/^-?\d+$/.test(ans)){modal('Invalid integer','Enter a whole integer, including a leading minus sign if needed.');return false}
+  state.answerBusy=true;
+  const submitButtons=[$('submitMcq'),$('submitInteger')].filter(Boolean);
+  submitButtons.forEach(b=>b.disabled=true);
+  submitButtons.forEach(b=>{if(!b.classList.contains('hidden'))b.dataset.originalText=b.textContent});
+  submitButtons.forEach(b=>{if(!b.classList.contains('hidden'))b.textContent='Saving…'});
+  const {error}=await sb.from('answers').upsert({lobby_id:state.lobby.id,user_id:state.me.id,question_number:q,answer:ans},{onConflict:'lobby_id,user_id,question_number'});
+  if(error){state.answerBusy=false;submitButtons.forEach(b=>{b.disabled=false;if(b.dataset.originalText)b.textContent=b.dataset.originalText});modal('Could not save answer',esc(error.message));return false}
+  state.answers[String(q)]=ans;
+  try{localStorage.setItem('dueltest:answers:'+state.lobby.id+':'+state.me.id,JSON.stringify(state.answers))}catch{}
+  const count=Object.keys(state.answers).length;
+  const {error:playerError}=await sb.from('lobby_players').update({current_question:q,answered_count:count}).eq('lobby_id',state.lobby.id).eq('user_id',state.me.id);
+  if(playerError)console.warn('Could not update live progress:',playerError);
+  state.mine={...state.mine,answered_count:count,current_question:q};
+  document.querySelector(`.q-btn[data-q="${q}"]`)?.classList.add('answered');
+  submitButtons.forEach(b=>{b.disabled=false;if(!b.classList.contains('hidden'))b.textContent='Saved ✓'});
+  setAnswerFeedback(`Saved ✓  ${ans}`,true);
+  if(state.answerFeedbackTimer)clearTimeout(state.answerFeedbackTimer);
+  state.answerFeedbackTimer=setTimeout(async()=>{
+    submitButtons.forEach(b=>{if(b.dataset.originalText)b.textContent=b.dataset.originalText});
+    state.answerBusy=false;
+    if(advance&&q<state.test.question_count)await selectQuestion(q+1);
+    else if(advance&&q>=state.test.question_count)setAnswerFeedback(`Saved ✓  ${ans} · Last question`,true);
+  },180);
+  return true;
+}
+
+function handleBattleKeydown(e){
+  if(!state.battleEntered||state.mine?.finished||$('battleView')?.classList.contains('hidden')||!$('battleView')?.classList.contains('active'))return;
+  const tag=(e.target?.tagName||'').toLowerCase();
+  const typing=tag==='input'||tag==='textarea'||tag==='select'||e.target?.isContentEditable;
+  const type=typeFor(state.currentQ);
+  if(typing){
+    if(e.key==='Enter'&&tag==='input'&&type==='INTEGER'){e.preventDefault();recordAnswer($('integerInput').value.trim(),{advance:true});}
+    return;
+  }
+  if(state.answerBusy)return;
+  const key=e.key;
+  if(['1','2','3','4','a','b','c','d','A','B','C','D'].includes(key)){
+    e.preventDefault();
+    const answer=/^[1-4]$/.test(key)?String.fromCharCode(64+Number(key)):key.toUpperCase();
+    const btn=document.querySelector(`.mcq-options button[data-answer="${answer}"]`);
+    if(!btn||$('mcqOptions').classList.contains('hidden'))return;
+    btn.click();
+    return;
+  }
+  if(key==='Enter'){
+    e.preventDefault();
+    if(type==='INTEGER')recordAnswer($('integerInput').value.trim(),{advance:true});
+    else recordAnswer(state.selected,{advance:true});
+    return;
+  }
+  if(key==='ArrowRight'){
+    e.preventDefault();
+    if(state.selected)recordAnswer(state.selected,{advance:true});
+    else if(state.currentQ<state.test.question_count)selectQuestion(state.currentQ+1);
+  }
+  if(key==='ArrowLeft'){
+    e.preventDefault();
+    if(state.currentQ>1)selectQuestion(state.currentQ-1);
+  }
+}
+window.addEventListener('keydown',handleBattleKeydown);
 
 function parseList(s){const out=[];(s||'').split(',').map(x=>x.trim()).filter(Boolean).forEach(x=>{if(x.includes('-')){let[a,b]=x.split('-').map(Number);if(Number.isFinite(a)&&Number.isFinite(b)){a=Math.min(a,b);b=Math.max(a,b);for(let i=a;i<=b;i++)out.push(i)}}else{const n=Number(x);if(Number.isFinite(n))out.push(n)}});return [...new Set(out)].sort((a,b)=>a-b)}
 function parsePartial(s){const out={};(s||'').split(',').map(x=>x.trim()).filter(Boolean).forEach(x=>{const [range,val]=x.split('=').map(y=>y.trim());const pct=Math.max(5,Math.min(95,Number(val)));if(!Number.isFinite(pct))return;if(range.includes('-')){let[a,b]=range.split('-').map(Number);a=Math.min(a,b);b=Math.max(a,b);for(let i=a;i<=b;i++)out[i]=pct/100}else{const n=Number(range);if(Number.isFinite(n))out[n]=pct/100}});return out}
@@ -267,13 +440,28 @@ async function loadPdfManifest(t){
 async function renderVisiblePage(){
   if(!state.visiblePages.length)return;
   const p=state.visiblePages[state.pageIndex];
-  // The viewer's page counter is the ACCESSIBLE page number, not the
-  // underlying concatenated PDF page number. Locked pages are removed from
-  // navigation, so showing p.global would make a jump from 6 to 14 look like
-  // a broken viewer. Keep global for internal PDF mapping only.
   $('pageNumber').textContent=state.pageIndex+1;
   if(p.locked)return nextAccessible(1);
-  $('pdfMessage').textContent='';const pg=await p.doc.getPage(p.page);const viewport=pg.getViewport({scale:state.zoom});const canvas=$('pdfCanvas'),wrap=$('pdfPageWrap');canvas.width=Math.ceil(viewport.width);canvas.height=Math.ceil(viewport.height);wrap.style.width=canvas.width+'px';wrap.style.height=Math.ceil(canvas.height*p.ratio)+'px';await pg.render({canvasContext:canvas.getContext('2d',{alpha:false}),viewport}).promise;let cut=wrap.querySelector('.battle-cut-line');if(!cut){cut=document.createElement('div');cut.className='battle-cut-line';wrap.appendChild(cut)}let label=cut.querySelector('.battle-cut-label');if(!label){label=document.createElement('span');label.className='battle-cut-label';label.textContent='ANSWER AREA HIDDEN';cut.appendChild(label)}const ratio=Math.max(.05,Math.min(1,p.ratio||1));cut.style.top='calc(100% - 3px)';cut.style.display=ratio<.999?'block':'none';
+  $('pdfMessage').textContent='';
+  const pg=await p.doc.getPage(p.page);
+  const viewport=pg.getViewport({scale:state.zoom});
+  const canvas=$('pdfCanvas'),wrap=$('pdfPageWrap');
+  const outputScale=Math.min(Math.max(window.devicePixelRatio||1,1),3);
+  canvas.width=Math.ceil(viewport.width*outputScale);
+  canvas.height=Math.ceil(viewport.height*outputScale);
+  canvas.style.width=Math.ceil(viewport.width)+'px';
+  canvas.style.height=Math.ceil(viewport.height)+'px';
+  wrap.style.width=Math.ceil(viewport.width)+'px';
+  wrap.style.height=Math.ceil(viewport.height*p.ratio)+'px';
+  const ctx=canvas.getContext('2d',{alpha:false,desynchronized:true});
+  ctx.setTransform(outputScale,0,0,outputScale,0,0);
+  await pg.render({canvasContext:ctx,viewport}).promise;
+  let cut=wrap.querySelector('.battle-cut-line');
+  if(!cut){cut=document.createElement('div');cut.className='battle-cut-line';wrap.appendChild(cut)}
+  let label=cut.querySelector('.battle-cut-label');
+  if(!label){label=document.createElement('span');label.className='battle-cut-label';label.textContent='ANSWER AREA HIDDEN';cut.appendChild(label)}
+  const ratio=Math.max(.05,Math.min(1,p.ratio||1));
+  cut.style.top='calc(100% - 3px)';cut.style.display=ratio<.999?'block':'none';
 }
 function nextAccessible(delta){const next=state.pageIndex+delta;if(next<0||next>=state.visiblePages.length)return;state.pageIndex=next;renderVisiblePage()}
 function gotoGlobalPage(global){const idx=state.visiblePages.findIndex(p=>p.global===global);if(idx>=0){state.pageIndex=idx;renderVisiblePage()}}
@@ -312,7 +500,15 @@ async function transitionToKeyIfReady(){
 async function refreshLobbyData(){const {data:l}=await sb.from('lobbies').select('*,tests(name,question_count,duration_minutes,question_types,page_rules,locked_pages,pdf_files)').eq('id',state.lobby.id).single();if(l)state.lobby=l}
 function showAnswerKey(){
   if(state.lobby.created_by!==state.me.id){state.keyShown=false;showWaitingFinish(false);return}
-  show('keyView');const types=state.test.question_types||{};$('answerKeyGrid').innerHTML=Array.from({length:state.test.question_count},(_,i)=>{const q=i+1,type=types[String(q)]||'MCQ';const placeholder=type==='MCQ'?'A / B / C / D':type==='INTEGER'?'Integer':'A,C / A,C,D';return `<div class="key-item"><label>Q${q} · ${type==='MULTI_CORRECT'?'MULTI-CORRECT':type}</label><input data-key="${q}" maxlength="12" placeholder="${placeholder}"></div>`}).join('')
+  show('keyView');
+  const types=state.test.question_types||{};
+  $('answerKeyGrid').innerHTML=Array.from({length:state.test.question_count},(_,i)=>{const q=i+1,type=types[String(q)]||'MCQ';const placeholder=type==='MCQ'?'A / B / C / D':type==='INTEGER'?'Integer':'A,C / A,C,D';return `<div class="key-item"><label>Q${q} · ${type==='MULTI_CORRECT'?'MULTI-CORRECT':type}</label><input data-key="${q}" maxlength="12" placeholder="${placeholder}"></div>`}).join('');
+  let saved={};try{saved=JSON.parse(localStorage.getItem('dueltest:key:'+state.lobby.id)||'{}')||{}}catch{}
+  document.querySelectorAll('[data-key]').forEach(input=>{if(saved[input.dataset.key])input.value=saved[input.dataset.key];input.addEventListener('input',()=>saveAnswerKeyDraft())});
+}
+function saveAnswerKeyDraft(){
+  const key={};document.querySelectorAll('[data-key]').forEach(i=>{const v=i.value.trim().toUpperCase();if(v)key[i.dataset.key]=v});
+  try{localStorage.setItem('dueltest:key:'+state.lobby.id,JSON.stringify(key))}catch{}
 }
 $('submitKeyBtn').onclick=submitAnswerKey;
 async function submitAnswerKey(){
@@ -326,11 +522,14 @@ async function submitAnswerKey(){
     if(type==='INTEGER'&&!/^-?\d+$/.test(v))return modal('Invalid key',`Q${q} is INTEGER; enter a whole integer.`);
     if(type==='MULTI_CORRECT'){v=canonicalMultiAnswer(v);if(!v)return modal('Invalid key',`Q${q} is MULTI-CORRECT; enter one or more of A, B, C, D, separated by commas.`);key[String(q)]=v;}
   }
+  saveAnswerKeyDraft();
   $('submitKeyBtn').disabled=true;
   const {data:attempt,error}=await sb.rpc('finalize_battle',{p_lobby_id:state.lobby.id,p_answer_key:key});
   if(error){$('submitKeyBtn').disabled=false;return modal('Could not finish battle',esc(error.message))}
   state.lobby.status='finished';
+  try{localStorage.removeItem('dueltest:key:'+state.lobby.id)}catch{}
   renderResults(attempt.results,attempt.answer_key);
+  loadHistory();loadActiveBattles();
   $('submitKeyBtn').disabled=false;
 }
 
@@ -350,7 +549,7 @@ $('pdfInput').onchange=async()=>{$('fileList').innerHTML=[...$('pdfInput').files
 function rulesToPartialString(){return Object.entries(state.partialRules).filter(([,v])=>Number(v)<100).sort((a,b)=>+a[0]-+b[0]).map(([p,v])=>`${p}=${v}`).join(',')}
 function renderPartialRules(){if(!$('partialRulesSummary'))return;const entries=Object.entries(state.partialRules).filter(([,v])=>Number(v)<100).sort((a,b)=>+a[0]-+b[0]);$('partialPagesInput').value=entries.map(([p,v])=>`${p}=${v}`).join(',');$('partialRulesSummary').innerHTML=entries.length?entries.map(([p,v])=>`<span class="partial-rule-chip">Page ${p}: top ${v}% <button type="button" data-remove-partial="${p}" aria-label="Remove page ${p}">×</button></span>`).join(''):'No partial-page rules yet.';document.querySelectorAll('[data-remove-partial]').forEach(b=>b.onclick=()=>{delete state.partialRules[+b.dataset.removePartial];renderPartialRules();renderEditorPreview()})}
 function editorSetPercent(v){v=Math.max(5,Math.min(100,Math.round(+v||100)));$('partialPercent').value=v;$('partialPercentValue').textContent=v+'%';const canvas=$('partialPreviewCanvas');if(!canvas.width)return;const h=canvas.height;const y=h*v/100;$('partialVisibleArea').style.height=y+'px';$('partialVisibleArea').style.display=v<100?'block':'none';$('partialHiddenArea').style.top=y+'px';$('partialHiddenArea').style.display=v<100?'block':'none';$('partialCutLine').style.top=y+'px';$('partialCutLine').style.display=v<100?'block':'none'}
-async function renderEditorPreview(){const pages=state.editorPdfPages;if(!pages.length){$('partialPreviewMessage').style.display='block';$('partialPreviewCanvas').style.display='none';$('partialPageLabel').textContent='Page 1 / —';return}const page=pages[state.editorPageIndex];$('partialPreviewMessage').style.display='none';$('partialPreviewCanvas').style.display='block';$('partialPageInput').value=page.global;$('partialPageLabel').textContent=`Page ${page.global} / ${pages.length}`;const pg=await page.doc.getPage(page.page);const base=pg.getViewport({scale:1});const scale=Math.min(1.25,620/base.width);const vp=pg.getViewport({scale});const c=$('partialPreviewCanvas');c.width=Math.ceil(vp.width);c.height=Math.ceil(vp.height);$('partialPreview').style.width=c.width+'px';$('partialPreview').style.height=c.height+'px';await pg.render({canvasContext:c.getContext('2d',{alpha:false}),viewport:vp}).promise;editorSetPercent(state.partialRules[page.global]??100)}
+async function renderEditorPreview(){const pages=state.editorPdfPages;if(!pages.length){$('partialPreviewMessage').style.display='block';$('partialPreviewCanvas').style.display='none';$('partialPageLabel').textContent='Page 1 / —';return}const page=pages[state.editorPageIndex];$('partialPreviewMessage').style.display='none';$('partialPreviewCanvas').style.display='block';$('partialPageInput').value=page.global;$('partialPageLabel').textContent=`Page ${page.global} / ${pages.length}`;const pg=await page.doc.getPage(page.page);const base=pg.getViewport({scale:1});const scale=Math.min(1.25,620/base.width);const vp=pg.getViewport({scale});const c=$('partialPreviewCanvas');const outputScale=Math.min(Math.max(window.devicePixelRatio||1,1),3);c.width=Math.ceil(vp.width*outputScale);c.height=Math.ceil(vp.height*outputScale);c.style.width=Math.ceil(vp.width)+'px';c.style.height=Math.ceil(vp.height)+'px';$('partialPreview').style.width=Math.ceil(vp.width)+'px';$('partialPreview').style.height=Math.ceil(vp.height)+'px';const ctx=c.getContext('2d',{alpha:false,desynchronized:true});ctx.setTransform(outputScale,0,0,outputScale,0,0);await pg.render({canvasContext:ctx,viewport:vp}).promise;editorSetPercent(state.partialRules[page.global]??100)}
 function setEditorPage(global){global=Math.max(1,Math.min(state.editorPdfPages.length,+global||1));const i=state.editorPdfPages.findIndex(p=>p.global===global);if(i>=0){state.editorPageIndex=i;renderEditorPreview()}}
 async function loadEditorPdfsFromFiles(files){state.editorPdfDocs=[];state.editorPdfPages=[];let global=0;for(const f of files){try{const url=URL.createObjectURL(f);const pdf=await window.pdfjsLib.getDocument({url}).promise;state.editorPdfDocs.push({pdf,url,name:f.name});for(let i=1;i<=pdf.numPages;i++)state.editorPdfPages.push({global:++global,doc:pdf,page:i})}catch(e){console.error(e);modal('Could not preview PDF',esc(e.message||e))}}state.editorPageIndex=0;renderEditorPreview()}
 async function loadEditorPdfsFromStorage(files){state.editorPdfDocs=[];state.editorPdfPages=[];let global=0;for(const f of files){try{const {data:signed,error:signedError}=await sb.storage.from('test-pdfs').createSignedUrl(f.path,3600);if(signedError||!signed?.signedUrl)throw signedError||new Error('Could not authorize PDF preview.');const url=signed.signedUrl;const pdf=await window.pdfjsLib.getDocument({url}).promise;state.editorPdfDocs.push({pdf,url,name:f.name});for(let i=1;i<=pdf.numPages;i++)state.editorPdfPages.push({global:++global,doc:pdf,page:i})}catch(e){console.error(e)}}state.editorPageIndex=0;renderEditorPreview()}
@@ -459,7 +658,12 @@ async function getVersion(id){const {data}=await sb.from('tests').select('versio
 
 async function viewHistory(id){const {data:a,error}=await sb.from('attempts').select('*').eq('id',id).single();if(error)return modal('Could not load battle',esc(error.message));const {data:t}=await sb.from('tests').select('question_count,question_types,name').eq('id',a.test_id).maybeSingle();state.test=t||{question_count:Math.max(...(a.results||[]).flatMap(r=>Object.keys(r.answers||{}).map(Number)),0),question_types:{},name:a.test_name};show('resultsView');renderResults(a.results,a.answer_key)}
 
-async function loadHistory(){const {data,error}=await sb.from('attempts').select('id,test_id,test_name,completed_at,results').order('completed_at',{ascending:false});if(error)return $('historyList').innerHTML=`<div class="empty">${esc(error.message)}</div>`;$('historyList').innerHTML=(data||[]).map(a=>{const me=a.results?.find(r=>r.user_id===state.me.id);return `<div class="history-item"><div class="item-main"><b>${esc(a.test_name)}</b><small>${new Date(a.completed_at).toLocaleString()} · ${(a.results||[]).length} players</small></div><div class="history-score">${me?.correct??0} correct</div><div class="item-actions"><button class="small-btn" data-history="${a.id}">View</button></div></div>`}).join('')||'<div class="empty">No completed battles yet.</div>';document.querySelectorAll('[data-history]').forEach(b=>b.onclick=()=>viewHistory(b.dataset.history))}
+async function loadHistory(){
+  const {data,error}=await sb.from('attempts').select('id,test_id,test_name,completed_at,results').order('completed_at',{ascending:false});
+  if(error){$('historyList').innerHTML=`<div class="empty">${esc(error.message)}</div>`;return}
+  $('historyList').innerHTML=(data||[]).map(a=>{const me=a.results?.find(r=>r.user_id===state.me.id);return `<div class="history-item"><div class="item-main"><b>${esc(a.test_name)}</b><small>${new Date(a.completed_at).toLocaleString()} · ${(a.results||[]).length} players</small></div><div class="history-score">${me?.correct??0} correct</div><div class="item-actions"><button class="small-btn" data-history="${a.id}">View</button></div></div>`}).join('')||'<div class="empty">No completed battles yet.</div>';
+  document.querySelectorAll('[data-history]').forEach(b=>b.onclick=()=>viewHistory(b.dataset.history));
+}
 
 // A small guard against stale tabs attempting to re-enter a finished battle.
 window.addEventListener('beforeunload',()=>{clearInterval(state.timer);if(state.lobbyChannel)sb?.removeChannel(state.lobbyChannel);if(state.battleChannel)sb?.removeChannel(state.battleChannel)});
